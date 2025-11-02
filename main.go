@@ -1,21 +1,221 @@
 package main
 
 import (
-  "fmt"
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 )
 
-//TIP <p>To run your code, right-click the code and select <b>Run</b>.</p> <p>Alternatively, click
-// the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.</p>
+// ============= CONFIGURATION =============
+
+type Config struct {
+	// App
+	AppPort string
+	AppEnv  string
+
+	// Database
+	DBHost     string
+	DBPort     string
+	DBName     string
+	DBUser     string
+	DBPassword string
+	DBSSLMode  string
+
+	// JWT
+	JWTSecret string
+	JWTIssuer string
+
+	// WhatsApp
+	AutoReconnect     bool
+	QRTimeout         time.Duration
+	MaxDevicesPerUser int
+
+	// CORS
+	CORSAllowedOrigins string
+}
+
+func LoadConfig() (*Config, error) {
+	// Load .env file if it exists
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using environment variables")
+	}
+
+	cfg := &Config{
+		// App
+		AppPort: getEnv("APP_PORT", "8080"),
+		AppEnv:  getEnv("APP_ENV", "development"),
+
+		// Database
+		DBHost:     getEnv("DB_HOST", "localhost"),
+		DBPort:     getEnv("DB_PORT", "5432"),
+		DBName:     getEnv("DB_NAME", "whatsapp_api"),
+		DBUser:     getEnv("DB_USER", "postgres"),
+		DBPassword: getEnv("DB_PASSWORD", ""),
+		DBSSLMode:  getEnv("DB_SSL_MODE", "disable"),
+
+		// JWT
+		JWTSecret: getEnv("JWT_SECRET", ""),
+		JWTIssuer: getEnv("JWT_ISSUER", ""),
+
+		// WhatsApp
+		AutoReconnect:     getEnv("WA_AUTO_RECONNECT", "true") == "true",
+		QRTimeout:         parseDuration(getEnv("WA_QR_TIMEOUT", "30s"), 30*time.Second),
+		MaxDevicesPerUser: parseInt(getEnv("MAX_DEVICES_PER_USER", "5"), 5),
+
+		// CORS
+		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "*"),
+	}
+
+	// Validate required fields
+	if cfg.JWTSecret == "" {
+		return nil, fmt.Errorf("JWT_SECRET is required")
+	}
+
+	if cfg.DBPassword == "" && cfg.AppEnv == "production" {
+		return nil, fmt.Errorf("DB_PASSWORD is required in production")
+	}
+
+	return cfg, nil
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func parseDuration(s string, defaultValue time.Duration) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return defaultValue
+	}
+	return d
+}
+
+func parseInt(s string, defaultValue int) int {
+	var value int
+	if _, err := fmt.Sscanf(s, "%d", &value); err != nil {
+		return defaultValue
+	}
+	return value
+}
+
+// ============= MAIN =============
 
 func main() {
-  //TIP <p>Press <shortcut actionId="ShowIntentionActions"/> when your caret is at the underlined text
-  // to see how GoLand suggests fixing the warning.</p><p>Alternatively, if available, click the lightbulb to view possible fixes.</p>
-  s := "gopher"
-  fmt.Printf("Hello and welcome, %s!\n", s)
 
-  for i := 1; i <= 5; i++ {
-	//TIP <p>To start your debugging session, right-click your code in the editor and select the Debug option.</p> <p>We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint
-	// for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.</p>
-	fmt.Println("i =", 100/i)
-  }
+	// Load configuration
+	cfg, err := LoadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Step 1: Test connection WITHOUT database name (connect to postgres db)
+	fmt.Println("\n🔍 Step 1: Testing connection to PostgreSQL server...")
+	fmt.Println("   (Connecting to 'postgres' database first)")
+
+	// Initialize database
+	log.Println("Initializing database...")
+	db, err := NewDatabaseManager(cfg)
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	defer db.Close()
+
+	// Initialize WebSocket manager
+	wsManager := NewWebSocketManager()
+
+	// Initialize WhatsApp service
+	log.Println("Initializing WhatsApp service...")
+	whatsappService := NewWhatsAppService(cfg, db, wsManager)
+
+	// Restore active sessions
+	if err := whatsappService.RestoreActiveSessions(); err != nil {
+		log.Printf("Failed to restore active sessions: %v", err)
+	}
+
+	// Initialize API handlers
+	handlers := NewAPIHandlers(whatsappService, db, wsManager, cfg)
+
+	// Setup Gin router
+	if cfg.AppEnv == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	router := gin.New()
+
+	// Apply middleware
+	router.Use(LoggerMiddleware())
+	router.Use(ErrorMiddleware())
+	router.Use(CORSMiddleware(cfg.CORSAllowedOrigins))
+
+	// Health check (no auth required)
+	router.GET("/health", handlers.HealthCheck)
+
+	// API v1 routes
+	v1 := router.Group("/api/v1")
+	{
+		// Protected routes (require JWT auth)
+		protected := v1.Group("/", AuthMiddleware(cfg.JWTSecret))
+		{
+			// Session management
+			protected.POST("/sessions", handlers.CreateSession)
+			protected.GET("/sessions", handlers.GetSessions)
+			protected.GET("/sessions/:session_id/qr", handlers.GetSessionQR)
+			protected.GET("/sessions/:session_id/status", handlers.GetSessionStatus)
+			protected.DELETE("/sessions/:session_id", handlers.DeleteSession)
+
+			// Messaging
+			protected.POST("/sessions/:session_id/send", handlers.SendMessage)
+
+			// Device summary
+			protected.GET("/devices/summary", handlers.GetDeviceSummary)
+		}
+
+		// WebSocket endpoint (uses token query param)
+		v1.GET("/sessions/:session_id/events", handlers.HandleWebSocket)
+	}
+
+	// Start server
+	srv := &http.Server{
+		Addr:         ":" + cfg.AppPort,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Graceful shutdown
+	go func() {
+		log.Printf("Starting server on port %s", cfg.AppPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+
+	// Graceful shutdown with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	log.Println("Server shutdown complete")
 }
