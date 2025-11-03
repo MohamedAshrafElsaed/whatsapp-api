@@ -27,7 +27,6 @@ type Config struct {
 	DBName     string
 	DBUser     string
 	DBPassword string
-	DBSSLMode  string
 
 	// JWT
 	JWTSecret string
@@ -55,11 +54,10 @@ func LoadConfig() (*Config, error) {
 
 		// Database
 		DBHost:     getEnv("DB_HOST", "localhost"),
-		DBPort:     getEnv("DB_PORT", "5432"),
+		DBPort:     getEnv("DB_PORT", "3306"),
 		DBName:     getEnv("DB_NAME", "whatsapp_api"),
-		DBUser:     getEnv("DB_USER", "postgres"),
+		DBUser:     getEnv("DB_USER", "root"),
 		DBPassword: getEnv("DB_PASSWORD", ""),
-		DBSSLMode:  getEnv("DB_SSL_MODE", "disable"),
 
 		// JWT
 		JWTSecret: getEnv("JWT_SECRET", ""),
@@ -119,9 +117,9 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Step 1: Test connection WITHOUT database name (connect to postgres db)
-	fmt.Println("\n🔍 Step 1: Testing connection to PostgreSQL server...")
-	fmt.Println("   (Connecting to 'postgres' database first)")
+	// Step 1: Test connection to MySQL server
+	fmt.Println("\n🔍 Step 1: Testing connection to MySQL server...")
+	fmt.Println("   Connecting to MySQL database...")
 
 	// Initialize database
 	log.Println("Initializing database...")

@@ -7,16 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
-	"gorm.io/driver/postgres"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+	_ "modernc.org/sqlite" // Pure Go SQLite driver (no CGO required)
 )
 
 // ============= MODELS =============
@@ -35,11 +38,11 @@ const (
 
 // WhatsAppSession represents a WhatsApp session in the database
 type WhatsAppSession struct {
-	ID             uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();primaryKey" json:"id"`
-	UserID         int            `gorm:"not null;index;index:idx_user_session,unique" json:"user_id"`
-	SessionName    string         `gorm:"size:255;not null;index:idx_user_session,unique" json:"session_name"`
+	ID             string         `gorm:"type:char(36);primaryKey" json:"id"`
+	UserID         int            `gorm:"not null;index;uniqueIndex:idx_user_session" json:"user_id"`
+	SessionName    string         `gorm:"size:255;not null;uniqueIndex:idx_user_session" json:"session_name"`
 	PhoneNumber    *string        `gorm:"size:20" json:"phone_number,omitempty"`
-	JID            *string        `gorm:"size:255;uniqueIndex" json:"jid,omitempty"`
+	JID            *string        `gorm:"column:j_id;size:255;uniqueIndex" json:"jid,omitempty"`
 	Status         SessionStatus  `gorm:"size:50;not null;default:'pending';index" json:"status"`
 	QRCode         *string        `gorm:"type:text" json:"-"`
 	QRCodeBase64   *string        `gorm:"type:text" json:"qr_code_base64,omitempty"`
@@ -49,7 +52,7 @@ type WhatsAppSession struct {
 	ConnectedAt    *time.Time     `json:"connected_at,omitempty"`
 	DisconnectedAt *time.Time     `json:"disconnected_at,omitempty"`
 	LastSeen       *time.Time     `json:"last_seen,omitempty"`
-	DeviceInfo     JSONB          `gorm:"type:jsonb" json:"device_info,omitempty"`
+	DeviceInfo     JSONData       `gorm:"type:json" json:"device_info,omitempty"`
 	PushName       *string        `gorm:"size:255" json:"push_name,omitempty"`
 	Platform       *string        `gorm:"size:50" json:"platform,omitempty"`
 	IsActive       bool           `gorm:"default:true;index" json:"is_active"`
@@ -58,27 +61,49 @@ type WhatsAppSession struct {
 	DeletedAt      gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
+// WhatsAppContact represents a contact
+type WhatsAppContact struct {
+	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	UserID       int       `gorm:"not null;index:idx_user_jid,unique" json:"user_id"`
+	FullName     string    `gorm:"size:255" json:"full_name"`
+	FirstName    string    `gorm:"size:100" json:"first_name"`
+	LastName     string    `gorm:"size:155" json:"last_name"`
+	JID          string    `gorm:"column:jid;size:255;not null;index:idx_user_jid,unique" json:"jid"`
+	CountryCode  string    `gorm:"size:10" json:"country_code"`
+	MobileNumber string    `gorm:"size:50" json:"mobile_number"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// BeforeCreate hook to generate UUID
+func (s *WhatsAppSession) BeforeCreate(tx *gorm.DB) error {
+	if s.ID == "" {
+		s.ID = uuid.New().String()
+	}
+	return nil
+}
+
 // WhatsAppEvent represents an event log
 type WhatsAppEvent struct {
 	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	SessionID uuid.UUID `gorm:"type:uuid;index" json:"session_id"`
+	SessionID string    `gorm:"type:char(36);index" json:"session_id"`
 	UserID    int       `gorm:"not null;index" json:"user_id"`
 	EventType string    `gorm:"size:100;not null;index" json:"event_type"`
-	EventData JSONB     `gorm:"type:jsonb" json:"event_data"`
+	EventData JSONData  `gorm:"type:json" json:"event_data"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// JSONB type for PostgreSQL JSONB fields
-type JSONB map[string]interface{}
+// JSONData type for MySQL JSON fields
+type JSONData map[string]interface{}
 
-func (j JSONB) Value() (driver.Value, error) {
+func (j JSONData) Value() (driver.Value, error) {
 	if j == nil {
 		return nil, nil
 	}
 	return json.Marshal(j)
 }
 
-func (j *JSONB) Scan(value interface{}) error {
+func (j *JSONData) Scan(value interface{}) error {
 	if value == nil {
 		*j = nil
 		return nil
@@ -91,7 +116,7 @@ func (j *JSONB) Scan(value interface{}) error {
 	case string:
 		data = []byte(v)
 	default:
-		return errors.New("unsupported type for JSONB")
+		return errors.New("unsupported type for JSONData")
 	}
 
 	return json.Unmarshal(data, j)
@@ -128,12 +153,18 @@ func (db *DatabaseManager) GetWhatsAppContainer() *sqlstore.Container {
 }
 
 func NewDatabaseManager(cfg *Config) (*DatabaseManager, error) {
-	// PostgreSQL connection string
-	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		cfg.DBHost, cfg.DBPort, cfg.DBUser, cfg.DBPassword, cfg.DBName, cfg.DBSSLMode)
+	// ========================================
+	// Part 1: MySQL for Application Data
+	// ========================================
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local",
+		cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBPort, cfg.DBName)
 
-	// GORM connection
-	gormDB, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+	log.Printf("📊 Connecting to MySQL database...")
+	log.Printf("   Host: %s:%s", cfg.DBHost, cfg.DBPort)
+	log.Printf("   Database: %s", cfg.DBName)
+
+	// GORM connection for application data
+	gormDB, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 		NowFunc: func() time.Time {
 			return time.Now().UTC()
@@ -141,7 +172,7 @@ func NewDatabaseManager(cfg *Config) (*DatabaseManager, error) {
 		PrepareStmt: true,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
+		return nil, fmt.Errorf("failed to connect to MySQL: %w", err)
 	}
 
 	// Configure connection pool
@@ -154,21 +185,39 @@ func NewDatabaseManager(cfg *Config) (*DatabaseManager, error) {
 	sqlDB.SetMaxOpenConns(100)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
-	// WhatsApp store container
-	container, err := sqlstore.New(context.Background(), "postgres", dsn, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create WhatsApp store container: %w", err)
+	log.Println("   ✅ MySQL connected successfully")
+
+	// ========================================
+	// Part 2: SQLite for WhatsApp Store
+	// ========================================
+	log.Println("📱 Setting up WhatsApp store (SQLite)...")
+
+	// Create data directory if it doesn't exist
+	dataDir := "./data"
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	waContainer := container
+	// SQLite database path
+	sqlitePath := filepath.Join(dataDir, "whatsapp_store.db")
+	log.Printf("   Store location: %s", sqlitePath)
+
+	// Create WhatsApp store container with SQLite
+	container, err := sqlstore.New(context.Background(), "sqlite", sqlitePath+"?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create WhatsApp store: %w", err)
+	}
+
+	log.Println("   ✅ WhatsApp store initialized")
 
 	dm := &DatabaseManager{
 		db:          gormDB,
 		sqlDB:       container,
-		waContainer: waContainer,
+		waContainer: container,
 	}
 
 	// Run migrations
+	log.Println("🔧 Running database migrations...")
 	if err := dm.Migrate(); err != nil {
 		return nil, err
 	}
@@ -178,62 +227,77 @@ func NewDatabaseManager(cfg *Config) (*DatabaseManager, error) {
 
 // Migrate creates all necessary tables and constraints
 func (dm *DatabaseManager) Migrate() error {
-	// Enable UUID extension
-	dm.db.Exec("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"")
-
 	// Auto migrate models
-	if err := dm.db.AutoMigrate(&WhatsAppSession{}, &WhatsAppEvent{}); err != nil {
+	if err := dm.db.AutoMigrate(&WhatsAppSession{}, &WhatsAppEvent{}, &WhatsAppContact{}); err != nil {
 		return err
 	}
 
-	// Create device limit function
+	// Create stored procedure for device limit check
+	dm.db.Exec(`DROP PROCEDURE IF EXISTS check_device_limit;`)
+
 	dm.db.Exec(`
-		CREATE OR REPLACE FUNCTION check_device_limit()
-		RETURNS TRIGGER AS $$
-		DECLARE
-			active_count INTEGER;
-			max_allowed INTEGER := 5;
+		CREATE PROCEDURE check_device_limit(IN p_user_id INT, IN p_session_id CHAR(36))
 		BEGIN
+			DECLARE active_count INT;
+			DECLARE max_allowed INT DEFAULT 5;
+			
 			SELECT COUNT(*) INTO active_count
-			FROM whatsapp_sessions
-			WHERE user_id = NEW.user_id
+			FROM whats_app_sessions
+			WHERE user_id = p_user_id
 				AND is_active = true
 				AND status IN ('connected', 'pending', 'qr_ready', 'scanning')
-				AND id != NEW.id
+				AND id != p_session_id
 				AND deleted_at IS NULL;
 			
 			IF active_count >= max_allowed THEN
-				RAISE EXCEPTION 'Device limit exceeded. Maximum % devices allowed per user.', max_allowed;
+				SIGNAL SQLSTATE '45000' 
+				SET MESSAGE_TEXT = 'Device limit exceeded. Maximum 5 devices allowed per user.';
 			END IF;
-			
-			RETURN NEW;
 		END;
-		$$ LANGUAGE plpgsql;
 	`)
 
-	// Create trigger
+	// Create trigger for INSERT
+	dm.db.Exec(`DROP TRIGGER IF EXISTS enforce_device_limit_insert;`)
+
 	dm.db.Exec(`
-		DROP TRIGGER IF EXISTS enforce_device_limit ON whatsapp_sessions;
-		CREATE TRIGGER enforce_device_limit
-			BEFORE INSERT OR UPDATE ON whatsapp_sessions
-			FOR EACH ROW
-			WHEN (NEW.status IN ('pending', 'qr_ready', 'scanning', 'connected') AND NEW.is_active = true)
-			EXECUTE FUNCTION check_device_limit();
+		CREATE TRIGGER enforce_device_limit_insert
+		BEFORE INSERT ON whats_app_sessions
+		FOR EACH ROW
+		BEGIN
+			IF NEW.status IN ('pending', 'qr_ready', 'scanning', 'connected') AND NEW.is_active = true THEN
+				CALL check_device_limit(NEW.user_id, NEW.id);
+			END IF;
+		END;
+	`)
+
+	// Create trigger for UPDATE
+	dm.db.Exec(`DROP TRIGGER IF EXISTS enforce_device_limit_update;`)
+
+	dm.db.Exec(`
+		CREATE TRIGGER enforce_device_limit_update
+		BEFORE UPDATE ON whats_app_sessions
+		FOR EACH ROW
+		BEGIN
+			IF NEW.status IN ('pending', 'qr_ready', 'scanning', 'connected') AND NEW.is_active = true THEN
+				CALL check_device_limit(NEW.user_id, NEW.id);
+			END IF;
+		END;
 	`)
 
 	// Create indexes
-	dm.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_user_status ON whatsapp_sessions(user_id, status) WHERE deleted_at IS NULL")
-	dm.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_session_created ON whatsapp_events(session_id, created_at DESC)")
+	dm.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_user_status ON whats_app_sessions(user_id, status)")
+	dm.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_session_created ON whats_app_events(session_id, created_at DESC)")
 
-	log.Println("Database migration completed")
+	log.Println("   ✅ Migrations completed")
 	return nil
 }
 
 // ============= SESSION REPOSITORY =============
 
 func (dm *DatabaseManager) CreateSession(userID int, sessionName string) (*WhatsAppSession, error) {
+	sessionID := uuid.New()
 	session := &WhatsAppSession{
-		ID:          uuid.New(),
+		ID:          sessionID.String(),
 		UserID:      userID,
 		SessionName: sessionName,
 		Status:      StatusPending,
@@ -249,7 +313,7 @@ func (dm *DatabaseManager) CreateSession(userID int, sessionName string) (*Whats
 
 func (dm *DatabaseManager) GetSession(sessionID uuid.UUID, userID int) (*WhatsAppSession, error) {
 	var session WhatsAppSession
-	err := dm.db.Where("id = ? AND user_id = ?", sessionID, userID).First(&session).Error
+	err := dm.db.Where("id = ? AND user_id = ?", sessionID.String(), userID).First(&session).Error
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +334,7 @@ func (dm *DatabaseManager) UpdateSession(session *WhatsAppSession) error {
 
 func (dm *DatabaseManager) UpdateSessionStatus(sessionID uuid.UUID, status SessionStatus) error {
 	return dm.db.Model(&WhatsAppSession{}).
-		Where("id = ?", sessionID).
+		Where("id = ?", sessionID.String()).
 		Updates(map[string]interface{}{
 			"status":     status,
 			"updated_at": time.Now(),
@@ -278,32 +342,49 @@ func (dm *DatabaseManager) UpdateSessionStatus(sessionID uuid.UUID, status Sessi
 }
 
 func (dm *DatabaseManager) DeleteSession(sessionID uuid.UUID, userID int) error {
-	return dm.db.Where("id = ? AND user_id = ?", sessionID, userID).
+	return dm.db.Where("id = ? AND user_id = ?", sessionID.String(), userID).
 		Delete(&WhatsAppSession{}).Error
 }
 
 func (dm *DatabaseManager) SetSessionConnected(sessionID uuid.UUID, jid, phoneNumber, pushName, platform string) error {
 	now := time.Now()
-	return dm.db.Model(&WhatsAppSession{}).
-		Where("id = ?", sessionID).
-		Updates(map[string]interface{}{
-			"status":          StatusConnected,
-			"jid":             jid,
-			"phone_number":    phoneNumber,
-			"push_name":       pushName,
-			"platform":        platform,
-			"connected_at":    now,
-			"last_seen":       now,
-			"disconnected_at": nil,
-			"qr_code":         nil,
-			"qr_code_base64":  nil,
-		}).Error
+
+	updates := map[string]interface{}{
+		"status":          StatusConnected,
+		"j_id":            jid,
+		"phone_number":    phoneNumber,
+		"push_name":       pushName,
+		"platform":        platform,
+		"connected_at":    now,
+		"last_seen":       now,
+		"disconnected_at": nil,
+		"qr_code":         nil,
+		"qr_code_base64":  nil,
+	}
+
+	result := dm.db.Model(&WhatsAppSession{}).
+		Where("id = ?", sessionID.String()).
+		Select("*"). // ← Add this to force update all fields
+		Updates(updates)
+
+	if result.Error != nil {
+		log.Printf("❌ Failed to update session %s: %v", sessionID.String(), result.Error)
+		return result.Error
+	}
+
+	if result.RowsAffected == 0 {
+		log.Printf("⚠️ No rows updated for session %s - record not found?", sessionID.String())
+		return fmt.Errorf("session not found: %s", sessionID.String())
+	}
+
+	log.Printf("✅ Successfully updated session %s in database (rows affected: %d)", sessionID.String(), result.RowsAffected)
+	return nil
 }
 
 func (dm *DatabaseManager) SetSessionDisconnected(sessionID uuid.UUID) error {
 	now := time.Now()
 	return dm.db.Model(&WhatsAppSession{}).
-		Where("id = ?", sessionID).
+		Where("id = ?", sessionID.String()).
 		Updates(map[string]interface{}{
 			"status":          StatusDisconnected,
 			"disconnected_at": now,
@@ -316,7 +397,7 @@ func (dm *DatabaseManager) UpdateSessionQR(sessionID uuid.UUID, qrCode, base64QR
 	expiresAt := now.Add(timeout)
 
 	return dm.db.Model(&WhatsAppSession{}).
-		Where("id = ?", sessionID).
+		Where("id = ?", sessionID.String()).
 		Updates(map[string]interface{}{
 			"status":          StatusQRReady,
 			"qr_code":         qrCode,
@@ -339,7 +420,7 @@ func (dm *DatabaseManager) GetActiveSessionCount(userID int) (int64, error) {
 
 func (dm *DatabaseManager) CreateEvent(sessionID uuid.UUID, userID int, eventType string, data map[string]interface{}) error {
 	event := &WhatsAppEvent{
-		SessionID: sessionID,
+		SessionID: sessionID.String(),
 		UserID:    userID,
 		EventType: eventType,
 		EventData: data,
@@ -350,7 +431,7 @@ func (dm *DatabaseManager) CreateEvent(sessionID uuid.UUID, userID int, eventTyp
 
 func (dm *DatabaseManager) GetSessionEvents(sessionID uuid.UUID, limit int) ([]WhatsAppEvent, error) {
 	var events []WhatsAppEvent
-	query := dm.db.Where("session_id = ?", sessionID).Order("created_at DESC")
+	query := dm.db.Where("session_id = ?", sessionID.String()).Order("created_at DESC")
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
@@ -398,8 +479,10 @@ func (dm *DatabaseManager) GetUserDeviceSummary(userID int) (*DeviceSummary, err
 			}
 		}
 
+		// Parse UUID from string
+		sessionUUID, _ := uuid.Parse(session.ID)
 		summary.Sessions = append(summary.Sessions, SessionSummary{
-			ID:          session.ID,
+			ID:          sessionUUID,
 			SessionName: session.SessionName,
 			Status:      session.Status,
 			PhoneNumber: session.PhoneNumber,
@@ -452,4 +535,35 @@ func (dm *DatabaseManager) Close() error {
 		sqlDB.Close()
 	}
 	return nil
+}
+
+// ============= CONTACT REPOSITORY =============
+
+func (dm *DatabaseManager) UpsertContact(contact *WhatsAppContact) error {
+	// Use ON DUPLICATE KEY UPDATE (upsert)
+	return dm.db.Save(contact).Error
+}
+
+func (dm *DatabaseManager) BulkUpsertContacts(contacts []WhatsAppContact) error {
+	if len(contacts) == 0 {
+		return nil
+	}
+
+	// Batch insert/update
+	return dm.db.Transaction(func(tx *gorm.DB) error {
+		for _, contact := range contacts {
+			if err := tx.Save(&contact).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (dm *DatabaseManager) GetUserContacts(userID int) ([]WhatsAppContact, error) {
+	var contacts []WhatsAppContact
+	err := dm.db.Where("user_id = ?", userID).
+		Order("full_name ASC").
+		Find(&contacts).Error
+	return contacts, err
 }

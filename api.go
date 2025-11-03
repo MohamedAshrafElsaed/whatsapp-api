@@ -317,7 +317,7 @@ func (h *APIHandlers) GetSessionQR(c *gin.Context) {
 	}
 
 	// Get QR code
-	qrCode, err := h.whatsappService.GetQRCode(sessionID, userID)
+	qrCode, err := h.whatsappService.GetQRCode(sessionIDStr, userID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -357,8 +357,8 @@ func (h *APIHandlers) GetSessionStatus(c *gin.Context) {
 	userID := c.GetInt("user_id")
 	sessionIDStr := c.Param("session_id")
 
-	// Parse session ID
-	sessionID, err := uuid.Parse(sessionIDStr)
+	// Parse session ID (validate format)
+	_, err := uuid.Parse(sessionIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -368,7 +368,7 @@ func (h *APIHandlers) GetSessionStatus(c *gin.Context) {
 	}
 
 	// Get session status
-	session, err := h.whatsappService.GetSessionStatus(sessionID, userID)
+	session, err := h.whatsappService.GetSessionStatus(sessionIDStr, userID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{
 			"success": false,
@@ -396,8 +396,8 @@ func (h *APIHandlers) DeleteSession(c *gin.Context) {
 	userID := c.GetInt("user_id")
 	sessionIDStr := c.Param("session_id")
 
-	// Parse session ID
-	sessionID, err := uuid.Parse(sessionIDStr)
+	// Parse session ID (validate format)
+	_, err := uuid.Parse(sessionIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -407,7 +407,7 @@ func (h *APIHandlers) DeleteSession(c *gin.Context) {
 	}
 
 	// Delete session
-	if err := h.whatsappService.DeleteSession(sessionID, userID); err != nil {
+	if err := h.whatsappService.DeleteSession(sessionIDStr, userID); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
 			"error":   err.Error(),
@@ -459,8 +459,8 @@ func (h *APIHandlers) SendMessage(c *gin.Context) {
 		return
 	}
 
-	// Parse session ID
-	sessionID, err := uuid.Parse(sessionIDStr)
+	// Parse session ID (validate format)
+	_, err := uuid.Parse(sessionIDStr)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
@@ -470,7 +470,7 @@ func (h *APIHandlers) SendMessage(c *gin.Context) {
 	}
 
 	// Send message
-	if err := h.whatsappService.SendMessage(sessionID, userID, req.To, req.Message); err != nil {
+	if err := h.whatsappService.SendMessage(sessionIDStr, userID, req.To, req.Message); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"success": false,
 			"error":   err.Error(),
@@ -538,8 +538,8 @@ func (h *APIHandlers) HandleWebSocket(c *gin.Context) {
 	defer conn.Close()
 
 	// Add connection to manager
-	h.wsManager.AddConnection(sessionID, conn)
-	defer h.wsManager.RemoveConnection(sessionID, conn)
+	h.wsManager.AddConnection(sessionIDStr, conn)
+	defer h.wsManager.RemoveConnection(sessionIDStr, conn)
 
 	// Send initial status
 	conn.WriteJSON(WebSocketMessage{
