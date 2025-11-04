@@ -4,15 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
-	"strings"
-	"sync"
-	"time"
-
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/mdp/qrterminal/v3"
-	qrcode "github.com/skip2/go-qrcode"
+	"github.com/nyaruka/phonenumbers"
+	"github.com/skip2/go-qrcode"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
@@ -21,6 +17,14 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"io"
+	"log"
+	"mime"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 )
 
 // ============= BRANDING CONFIGURATION =============
@@ -539,17 +543,15 @@ func (ws *WhatsAppService) handleConnectedEvent(sc *SessionClient, evt *events.C
 	sessionUUID, _ := uuid.Parse(sc.SessionID)
 
 	// ============= ENSURE PUSH NAME IS SET =============
-	// Set the push name if it's not already set
 	if sc.Client.Store.PushName == "" {
 		sc.Client.Store.PushName = ClientName
 	}
 
 	// Send presence to ensure WhatsApp registers our push name
-	// This makes the name appear in the linked devices list
 	go func() {
-		time.Sleep(2 * time.Second)                                                  // Wait for connection to stabilize
-		ctx := context.Background()                                                  // ← ADD THIS LINE
-		if err := sc.Client.SendPresence(ctx, types.PresenceAvailable); err != nil { // ← ADD ctx HERE
+		time.Sleep(2 * time.Second)
+		ctx := context.Background()
+		if err := sc.Client.SendPresence(ctx, types.PresenceAvailable); err != nil {
 			log.Printf("⚠️  Failed to send presence for session %s: %v", sc.SessionID, err)
 		} else {
 			log.Printf("✅ Sent presence with push name '%s' for session %s",
@@ -557,16 +559,13 @@ func (ws *WhatsAppService) handleConnectedEvent(sc *SessionClient, evt *events.C
 		}
 	}()
 
-	// Only update if we have the info (avoid overwriting from PairSuccess)
+	// Only update if we have the info
 	if sc.Client.Store.ID != nil {
 		jid := sc.Client.Store.ID.String()
 		phoneNumber := sc.Client.Store.ID.User
 		platform := sc.Client.Store.Platform
 
-		// Only update if we actually have data
 		if jid != "" && phoneNumber != "" {
-			// Note: We DON'T update push_name here to preserve user's actual name from history sync
-			sessionUUID, _ := uuid.Parse(sc.SessionID)
 			ws.db.db.Model(&WhatsAppSession{}).
 				Where("id = ?", sessionUUID.String()).
 				Updates(map[string]interface{}{
@@ -579,8 +578,6 @@ func (ws *WhatsAppService) handleConnectedEvent(sc *SessionClient, evt *events.C
 				})
 
 			log.Printf("📱 Connected - Device: '%s', JID: %s, Platform: %s", ClientName, jid, platform)
-		} else {
-			log.Printf("Connected but Store not yet populated, keeping PairSuccess data")
 		}
 	}
 
@@ -597,6 +594,19 @@ func (ws *WhatsAppService) handleConnectedEvent(sc *SessionClient, evt *events.C
 	ws.db.CreateEvent(sessionUUID, sc.UserID, "connected", map[string]interface{}{
 		"push_name": sc.Client.Store.PushName,
 	})
+
+	// ============= NEW: SYNC GROUPS AND DETECT BUSINESS ACCOUNT =============
+	// Run in background to avoid blocking the connection event
+	go func() {
+		// Wait a bit for connection to stabilize
+		time.Sleep(3 * time.Second)
+
+		// Detect if this is a business account
+		ws.detectBusinessAccount(sc)
+
+		// Sync all groups
+		ws.syncUserGroups(sc)
+	}()
 }
 
 // handleDisconnectedEvent handles disconnected events
@@ -1011,49 +1021,26 @@ func (ws *WhatsAppService) Cleanup() {
 	ws.containerMu.Unlock()
 }
 
-// parseContact parses contact information from WhatsApp pushname
 func parseContact(jid, pushName string, userID int) *WhatsAppContact {
-	// Extract phone number from JID (format: 201097154916@s.whatsapp.net)
+	// Extract phone number from JID
 	phoneNumber := ""
 	if idx := strings.Index(jid, "@"); idx > 0 {
 		phoneNumber = jid[:idx]
-		// Remove device suffix if present (e.g., :7)
 		if colonIdx := strings.Index(phoneNumber, ":"); colonIdx > 0 {
 			phoneNumber = phoneNumber[:colonIdx]
 		}
 	}
 
-	// Parse country code (simple approach - first 1-4 digits)
+	// Parse country code dynamically using phonenumbers library
 	countryCode := ""
 	mobileNumber := phoneNumber
 
-	// Common country codes
-	if len(phoneNumber) > 0 {
-		// Try to detect country code (1-4 digits)
-		if strings.HasPrefix(phoneNumber, "20") { // Egypt
-			countryCode = "20"
-			mobileNumber = phoneNumber[2:]
-		} else if strings.HasPrefix(phoneNumber, "1") && len(phoneNumber) == 11 { // USA/Canada
-			countryCode = "1"
-			mobileNumber = phoneNumber[1:]
-		} else if strings.HasPrefix(phoneNumber, "44") { // UK
-			countryCode = "44"
-			mobileNumber = phoneNumber[2:]
-		} else if strings.HasPrefix(phoneNumber, "966") { // Saudi Arabia
-			countryCode = "966"
-			mobileNumber = phoneNumber[3:]
-		} else if strings.HasPrefix(phoneNumber, "971") { // UAE
-			countryCode = "971"
-			mobileNumber = phoneNumber[3:]
-		} else if len(phoneNumber) >= 2 {
-			// Generic: assume first 2-3 digits are country code
-			if len(phoneNumber) > 10 {
-				countryCode = phoneNumber[:3]
-				mobileNumber = phoneNumber[3:]
-			} else {
-				countryCode = phoneNumber[:2]
-				mobileNumber = phoneNumber[2:]
-			}
+	if phoneNumber != "" {
+		// Parse the phone number (assume international format)
+		num, err := phonenumbers.Parse("+"+phoneNumber, "")
+		if err == nil {
+			countryCode = fmt.Sprintf("%d", num.GetCountryCode())
+			mobileNumber = fmt.Sprintf("%d", num.GetNationalNumber())
 		}
 	}
 
@@ -1063,7 +1050,7 @@ func parseContact(jid, pushName string, userID int) *WhatsAppContact {
 	fullName := strings.TrimSpace(pushName)
 
 	if fullName != "" {
-		parts := strings.Fields(fullName) // Split by whitespace
+		parts := strings.Fields(fullName)
 		if len(parts) > 0 {
 			firstName = parts[0]
 			if len(parts) > 1 {
@@ -1081,4 +1068,538 @@ func parseContact(jid, pushName string, userID int) *WhatsAppContact {
 		CountryCode:  countryCode,
 		MobileNumber: mobileNumber,
 	}
+}
+
+// syncUserGroups syncs all user's WhatsApp groups to the database
+func (ws *WhatsAppService) syncUserGroups(sc *SessionClient) {
+	log.Printf("📱 Starting group sync for session %s", sc.SessionID)
+	ctx := context.Background()
+	groups, err := sc.Client.GetJoinedGroups(ctx)
+	if err != nil {
+		log.Printf("❌ Failed to fetch groups for session %s: %v", sc.SessionID, err)
+		return
+	}
+	if len(groups) == 0 {
+		log.Printf("ℹ️  No groups found for session %s", sc.SessionID)
+		return
+	}
+	log.Printf("📊 Found %d groups for session %s (will use %v delay between requests)",
+		len(groups), sc.SessionID, ws.cfg.GroupSyncDelay)
+
+	successCount := 0
+	errorCount := 0
+	rateLimitCount := 0
+
+	for i, groupInfo := range groups {
+		if i > 0 {
+			time.Sleep(ws.cfg.GroupSyncDelay)
+		}
+		err := ws.processGroupWithRetry(sc, groupInfo, ws.cfg.GroupSyncRetryAttempts)
+		if err != nil {
+			errorCount++
+			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate-overlimit") {
+				rateLimitCount++
+				log.Printf("⏸️  Rate limited on group %s, waiting 30 seconds...", groupInfo.JID.String())
+				time.Sleep(30 * time.Second)
+			} else {
+				log.Printf("❌ Failed to process group %s: %v", groupInfo.JID.String(), err)
+			}
+		} else {
+			successCount++
+		}
+		if (i+1)%10 == 0 {
+			log.Printf("📊 Progress: %d/%d groups processed", i+1, len(groups))
+		}
+	}
+	log.Printf("✅ Group sync completed for session %s: %d successful, %d failed (%d rate-limited)",
+		sc.SessionID, successCount, errorCount, rateLimitCount)
+
+	sessionUUID, _ := uuid.Parse(sc.SessionID)
+	ws.db.CreateEvent(sessionUUID, sc.UserID, "groups_synced", map[string]interface{}{
+		"total_groups": len(groups),
+		"successful":   successCount,
+		"failed":       errorCount,
+		"rate_limited": rateLimitCount,
+	})
+}
+
+// processGroup processes a single group and its participants
+func (ws *WhatsAppService) processGroup(sc *SessionClient, groupInfo *types.GroupInfo) error {
+	ctx := context.Background()
+	fullGroupInfo, err := sc.Client.GetGroupInfo(ctx, groupInfo.JID)
+	if err != nil {
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate-overlimit") {
+			return fmt.Errorf("rate limited: %w", err)
+		}
+		return fmt.Errorf("failed to get full group info: %w", err)
+	}
+	group := &WhatsAppGroup{
+		UserID:           sc.UserID,
+		SessionID:        sc.SessionID,
+		GroupJID:         groupInfo.JID.String(),
+		GroupName:        fullGroupInfo.Name,
+		GroupSubject:     &fullGroupInfo.Topic,
+		ParticipantCount: len(fullGroupInfo.Participants),
+		IsAnnouncement:   fullGroupInfo.IsAnnounce,
+		IsLocked:         fullGroupInfo.IsLocked,
+	}
+	if err := ws.db.UpsertGroup(group); err != nil {
+		return fmt.Errorf("failed to save group: %w", err)
+	}
+	savedGroup, err := ws.db.GetGroupByJID(sc.UserID, groupInfo.JID.String())
+	if err != nil {
+		return fmt.Errorf("failed to retrieve saved group: %w", err)
+	}
+	if len(fullGroupInfo.Participants) > 0 {
+		participants := make([]WhatsAppContact, 0, len(fullGroupInfo.Participants))
+		for _, participant := range fullGroupInfo.Participants {
+			jidStr := participant.JID.String()
+			pushName := participant.DisplayName
+			if pushName == "" {
+				pushName = participant.JID.User
+			}
+			contact := parseContact(jidStr, pushName, sc.UserID)
+			contact.GroupID = &savedGroup.ID
+			contact.IsGroupMember = true
+			participants = append(participants, *contact)
+		}
+		if err := ws.db.BulkUpsertContacts(participants); err != nil {
+			log.Printf("⚠️  Failed to save participants for group %s: %v", fullGroupInfo.Name, err)
+		} else {
+			log.Printf("👥 Saved %d participants for group %s", len(participants), fullGroupInfo.Name)
+		}
+	}
+	log.Printf("✅ Processed group: %s (%d participants)", fullGroupInfo.Name, len(fullGroupInfo.Participants))
+	return nil
+}
+
+// detectBusinessAccount checks if the connected account is a business account
+func (ws *WhatsAppService) detectBusinessAccount(sc *SessionClient) {
+	sessionUUID, _ := uuid.Parse(sc.SessionID)
+
+	// Check if business name is set in the store
+	isBusiness := sc.Client.Store.BusinessName != ""
+
+	// Update database
+	if err := ws.db.UpdateSessionBusinessAccount(sessionUUID, isBusiness); err != nil {
+		log.Printf("❌ Failed to update business account status for session %s: %v",
+			sc.SessionID, err)
+		return
+	}
+
+	if isBusiness {
+		log.Printf("🏢 Business account detected for session %s: %s",
+			sc.SessionID, sc.Client.Store.BusinessName)
+
+		// Log event
+		ws.db.CreateEvent(sessionUUID, sc.UserID, "business_account_detected", map[string]interface{}{
+			"business_name": sc.Client.Store.BusinessName,
+		})
+	} else {
+		log.Printf("👤 Personal account detected for session %s", sc.SessionID)
+	}
+}
+
+// ============= MEDIA UPLOAD HELPER =============
+
+// uploadMedia uploads media to WhatsApp servers
+func (ws *WhatsAppService) uploadMedia(sc *SessionClient, mediaData []byte, mediaType whatsmeow.MediaType) (*whatsmeow.UploadResponse, error) {
+	ctx := context.Background()
+
+	log.Printf("📤 Uploading media of type %s (%d bytes)", mediaType, len(mediaData))
+
+	resp, err := sc.Client.Upload(ctx, mediaData, mediaType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload media: %w", err)
+	}
+
+	log.Printf("✅ Media uploaded successfully - URL: %s", resp.URL)
+	return &resp, nil
+}
+
+// ============= IMAGE MESSAGE =============
+
+// SendImageMessage sends an image message with optional caption
+func (ws *WhatsAppService) SendImageMessage(sessionID string, userID int, to string, imageData []byte, caption string) error {
+	sc, err := ws.GetSessionClient(sessionID)
+	if err != nil {
+		return err
+	}
+
+	if !sc.Client.IsConnected() {
+		return fmt.Errorf("client not connected")
+	}
+
+	// Validate recipient
+	recipient, err := ws.validateAndGetRecipient(sc, to)
+	if err != nil {
+		return err
+	}
+
+	// Upload image
+	uploaded, err := ws.uploadMedia(sc, imageData, whatsmeow.MediaImage)
+	if err != nil {
+		return err
+	}
+
+	// Detect MIME type
+	mimeType := http.DetectContentType(imageData)
+
+	// Create image message
+	imageMsg := &waE2E.ImageMessage{
+		Caption:       proto.String(caption),
+		Mimetype:      proto.String(mimeType),
+		URL:           &uploaded.URL,
+		DirectPath:    &uploaded.DirectPath,
+		MediaKey:      uploaded.MediaKey,
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    &uploaded.FileLength,
+	}
+
+	message := &waE2E.Message{
+		ImageMessage: imageMsg,
+	}
+
+	// Send message
+	ctx := context.Background()
+	resp, err := sc.Client.SendMessage(ctx, recipient, message)
+	if err != nil {
+		return fmt.Errorf("failed to send image message: %w", err)
+	}
+
+	log.Printf("✅ Image message sent to %s (ID: %s)", recipient.String(), resp.ID)
+
+	// Send WebSocket notification
+	ws.wsManager.SendToSession(sessionID, WebSocketMessage{
+		Type: "message_sent",
+		Data: map[string]interface{}{
+			"message_id": resp.ID,
+			"to":         recipient.String(),
+			"type":       "image",
+			"timestamp":  resp.Timestamp,
+		},
+	})
+
+	return nil
+}
+
+// ============= VIDEO MESSAGE =============
+
+// SendVideoMessage sends a video message with optional caption
+func (ws *WhatsAppService) SendVideoMessage(sessionID string, userID int, to string, videoData []byte, caption string) error {
+	sc, err := ws.GetSessionClient(sessionID)
+	if err != nil {
+		return err
+	}
+
+	if !sc.Client.IsConnected() {
+		return fmt.Errorf("client not connected")
+	}
+
+	// Validate recipient
+	recipient, err := ws.validateAndGetRecipient(sc, to)
+	if err != nil {
+		return err
+	}
+
+	// Upload video
+	uploaded, err := ws.uploadMedia(sc, videoData, whatsmeow.MediaVideo)
+	if err != nil {
+		return err
+	}
+
+	// Detect MIME type
+	mimeType := http.DetectContentType(videoData)
+	if mimeType == "application/octet-stream" {
+		mimeType = "video/mp4" // Default to mp4
+	}
+
+	// Create video message
+	videoMsg := &waE2E.VideoMessage{
+		Caption:       proto.String(caption),
+		Mimetype:      proto.String(mimeType),
+		URL:           &uploaded.URL,
+		DirectPath:    &uploaded.DirectPath,
+		MediaKey:      uploaded.MediaKey,
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    &uploaded.FileLength,
+	}
+
+	message := &waE2E.Message{
+		VideoMessage: videoMsg,
+	}
+
+	// Send message
+	ctx := context.Background()
+	resp, err := sc.Client.SendMessage(ctx, recipient, message)
+	if err != nil {
+		return fmt.Errorf("failed to send video message: %w", err)
+	}
+
+	log.Printf("✅ Video message sent to %s (ID: %s)", recipient.String(), resp.ID)
+
+	ws.wsManager.SendToSession(sessionID, WebSocketMessage{
+		Type: "message_sent",
+		Data: map[string]interface{}{
+			"message_id": resp.ID,
+			"to":         recipient.String(),
+			"type":       "video",
+			"timestamp":  resp.Timestamp,
+		},
+	})
+
+	return nil
+}
+
+// ============= AUDIO MESSAGE =============
+
+// SendAudioMessage sends an audio message (voice note or audio file)
+func (ws *WhatsAppService) SendAudioMessage(sessionID string, userID int, to string, audioData []byte, isVoice bool) error {
+	sc, err := ws.GetSessionClient(sessionID)
+	if err != nil {
+		return err
+	}
+
+	if !sc.Client.IsConnected() {
+		return fmt.Errorf("client not connected")
+	}
+
+	// Validate recipient
+	recipient, err := ws.validateAndGetRecipient(sc, to)
+	if err != nil {
+		return err
+	}
+
+	// Upload audio
+	uploaded, err := ws.uploadMedia(sc, audioData, whatsmeow.MediaAudio)
+	if err != nil {
+		return err
+	}
+
+	// Detect MIME type
+	mimeType := http.DetectContentType(audioData)
+	if mimeType == "application/octet-stream" {
+		mimeType = "audio/ogg; codecs=opus" // Default for voice notes
+	}
+
+	// Create audio message
+	audioMsg := &waE2E.AudioMessage{
+		Mimetype:      proto.String(mimeType),
+		URL:           &uploaded.URL,
+		DirectPath:    &uploaded.DirectPath,
+		MediaKey:      uploaded.MediaKey,
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    &uploaded.FileLength,
+		PTT:           proto.Bool(isVoice), // PTT = Push To Talk (voice note)
+	}
+
+	message := &waE2E.Message{
+		AudioMessage: audioMsg,
+	}
+
+	// Send message
+	ctx := context.Background()
+	resp, err := sc.Client.SendMessage(ctx, recipient, message)
+	if err != nil {
+		return fmt.Errorf("failed to send audio message: %w", err)
+	}
+
+	audioType := "audio"
+	if isVoice {
+		audioType = "voice"
+	}
+
+	log.Printf("✅ %s message sent to %s (ID: %s)", audioType, recipient.String(), resp.ID)
+
+	ws.wsManager.SendToSession(sessionID, WebSocketMessage{
+		Type: "message_sent",
+		Data: map[string]interface{}{
+			"message_id": resp.ID,
+			"to":         recipient.String(),
+			"type":       audioType,
+			"timestamp":  resp.Timestamp,
+		},
+	})
+
+	return nil
+}
+
+// ============= DOCUMENT MESSAGE =============
+
+// SendDocumentMessage sends a document with filename and MIME type
+func (ws *WhatsAppService) SendDocumentMessage(sessionID string, userID int, to string, docData []byte, filename, mimetype string) error {
+	sc, err := ws.GetSessionClient(sessionID)
+	if err != nil {
+		return err
+	}
+
+	if !sc.Client.IsConnected() {
+		return fmt.Errorf("client not connected")
+	}
+
+	// Validate recipient
+	recipient, err := ws.validateAndGetRecipient(sc, to)
+	if err != nil {
+		return err
+	}
+
+	// Upload document
+	uploaded, err := ws.uploadMedia(sc, docData, whatsmeow.MediaDocument)
+	if err != nil {
+		return err
+	}
+
+	// Auto-detect MIME type if not provided
+	if mimetype == "" {
+		mimetype = http.DetectContentType(docData)
+		if mimetype == "application/octet-stream" {
+			// Try to guess from filename extension
+			ext := filepath.Ext(filename)
+			mimetype = mime.TypeByExtension(ext)
+			if mimetype == "" {
+				mimetype = "application/octet-stream"
+			}
+		}
+	}
+
+	// Set default filename if not provided
+	if filename == "" {
+		filename = "document"
+	}
+
+	// Create document message
+	docMsg := &waE2E.DocumentMessage{
+		FileName:      proto.String(filename),
+		Mimetype:      proto.String(mimetype),
+		URL:           &uploaded.URL,
+		DirectPath:    &uploaded.DirectPath,
+		MediaKey:      uploaded.MediaKey,
+		FileEncSHA256: uploaded.FileEncSHA256,
+		FileSHA256:    uploaded.FileSHA256,
+		FileLength:    &uploaded.FileLength,
+	}
+
+	message := &waE2E.Message{
+		DocumentMessage: docMsg,
+	}
+
+	// Send message
+	ctx := context.Background()
+	resp, err := sc.Client.SendMessage(ctx, recipient, message)
+	if err != nil {
+		return fmt.Errorf("failed to send document message: %w", err)
+	}
+
+	log.Printf("✅ Document message sent to %s (ID: %s, file: %s)", recipient.String(), resp.ID, filename)
+
+	ws.wsManager.SendToSession(sessionID, WebSocketMessage{
+		Type: "message_sent",
+		Data: map[string]interface{}{
+			"message_id": resp.ID,
+			"to":         recipient.String(),
+			"type":       "document",
+			"filename":   filename,
+			"timestamp":  resp.Timestamp,
+		},
+	})
+
+	return nil
+}
+
+// ============= HELPER FUNCTIONS =============
+
+// validateAndGetRecipient validates and returns the recipient JID
+func (ws *WhatsAppService) validateAndGetRecipient(sc *SessionClient, to string) (types.JID, error) {
+	var recipient types.JID
+	var err error
+
+	// Try to parse as JID first (e.g., 201097154916@s.whatsapp.net)
+	if strings.Contains(to, "@") {
+		recipient, err = types.ParseJID(to)
+		if err != nil {
+			return types.JID{}, fmt.Errorf("invalid JID format: %w", err)
+		}
+	} else {
+		// Clean the phone number - remove + and any non-digit characters
+		cleanNumber := ""
+		for _, char := range to {
+			if char >= '0' && char <= '9' {
+				cleanNumber += string(char)
+			}
+		}
+
+		if cleanNumber == "" {
+			return types.JID{}, fmt.Errorf("invalid phone number format")
+		}
+
+		// Verify the number is on WhatsApp
+		resp, err := sc.Client.IsOnWhatsApp(context.Background(), []string{"+" + cleanNumber})
+		if err != nil {
+			return types.JID{}, fmt.Errorf("failed to verify WhatsApp number: %w", err)
+		}
+
+		if len(resp) == 0 || !resp[0].IsIn {
+			return types.JID{}, fmt.Errorf("phone number %s is not registered on WhatsApp", cleanNumber)
+		}
+
+		recipient = resp[0].JID
+		log.Printf("📱 Verified number %s -> JID: %s", cleanNumber, recipient.String())
+	}
+
+	return recipient, nil
+}
+
+// downloadMediaFromURL downloads media from a URL
+func (ws *WhatsAppService) downloadMediaFromURL(url string, maxSize int64) ([]byte, error) {
+	log.Printf("📥 Downloading media from URL: %s", url)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download media: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to download media: HTTP %d", resp.StatusCode)
+	}
+
+	// Check content length
+	if resp.ContentLength > maxSize {
+		return nil, fmt.Errorf("file too large: %d bytes (max %d bytes)", resp.ContentLength, maxSize)
+	}
+
+	// Read with size limit
+	limitedReader := io.LimitReader(resp.Body, maxSize)
+	data, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read media data: %w", err)
+	}
+
+	log.Printf("✅ Downloaded %d bytes from URL", len(data))
+	return data, nil
+}
+
+func (ws *WhatsAppService) processGroupWithRetry(sc *SessionClient, groupInfo *types.GroupInfo, maxRetries int) error {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			waitTime := time.Duration(5*(1<<uint(attempt-1))) * time.Second
+			log.Printf("🔄 Retry attempt %d/%d for group %s after %v",
+				attempt+1, maxRetries, groupInfo.JID.String(), waitTime)
+			time.Sleep(waitTime)
+		}
+		err := ws.processGroup(sc, groupInfo)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate-overlimit") {
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
 }

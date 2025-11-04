@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"gorm.io/gorm/clause"
 	"log"
 	"os"
 	"path/filepath"
@@ -38,41 +39,58 @@ const (
 
 // WhatsAppSession represents a WhatsApp session in the database
 type WhatsAppSession struct {
-	ID             string         `gorm:"type:char(36);primaryKey" json:"id"`
-	UserID         int            `gorm:"not null;index;uniqueIndex:idx_user_session" json:"user_id"`
-	SessionName    string         `gorm:"size:255;not null;uniqueIndex:idx_user_session" json:"session_name"`
-	PhoneNumber    *string        `gorm:"size:20" json:"phone_number,omitempty"`
-	JID            *string        `gorm:"column:j_id;size:255;uniqueIndex" json:"jid,omitempty"`
-	Status         SessionStatus  `gorm:"size:50;not null;default:'pending';index" json:"status"`
-	QRCode         *string        `gorm:"type:text" json:"-"`
-	QRCodeBase64   *string        `gorm:"type:text" json:"qr_code_base64,omitempty"`
-	QRGeneratedAt  *time.Time     `json:"qr_generated_at,omitempty"`
-	QRExpiresAt    *time.Time     `json:"qr_expires_at,omitempty"`
-	QRRetryCount   int            `gorm:"default:0" json:"qr_retry_count"`
-	ConnectedAt    *time.Time     `json:"connected_at,omitempty"`
-	DisconnectedAt *time.Time     `json:"disconnected_at,omitempty"`
-	LastSeen       *time.Time     `json:"last_seen,omitempty"`
-	DeviceInfo     JSONData       `gorm:"type:json" json:"device_info,omitempty"`
-	PushName       *string        `gorm:"size:255" json:"push_name,omitempty"`
-	Platform       *string        `gorm:"size:50" json:"platform,omitempty"`
-	IsActive       bool           `gorm:"default:true;index" json:"is_active"`
-	CreatedAt      time.Time      `json:"created_at"`
-	UpdatedAt      time.Time      `json:"updated_at"`
-	DeletedAt      gorm.DeletedAt `gorm:"index" json:"-"`
+	ID                string         `gorm:"type:char(36);primaryKey" json:"id"`
+	UserID            int            `gorm:"not null;index;uniqueIndex:idx_user_session" json:"user_id"`
+	SessionName       string         `gorm:"size:255;not null;uniqueIndex:idx_user_session" json:"session_name"`
+	PhoneNumber       *string        `gorm:"size:20" json:"phone_number,omitempty"`
+	JID               *string        `gorm:"column:j_id;size:255;uniqueIndex" json:"jid,omitempty"`
+	Status            SessionStatus  `gorm:"size:50;not null;default:'pending';index" json:"status"`
+	QRCode            *string        `gorm:"type:text" json:"-"`
+	QRCodeBase64      *string        `gorm:"type:text" json:"qr_code_base64,omitempty"`
+	QRGeneratedAt     *time.Time     `json:"qr_generated_at,omitempty"`
+	QRExpiresAt       *time.Time     `json:"qr_expires_at,omitempty"`
+	QRRetryCount      int            `gorm:"default:0" json:"qr_retry_count"`
+	ConnectedAt       *time.Time     `json:"connected_at,omitempty"`
+	DisconnectedAt    *time.Time     `json:"disconnected_at,omitempty"`
+	LastSeen          *time.Time     `json:"last_seen,omitempty"`
+	DeviceInfo        JSONData       `gorm:"type:json" json:"device_info,omitempty"`
+	PushName          *string        `gorm:"size:255" json:"push_name,omitempty"`
+	Platform          *string        `gorm:"size:50" json:"platform,omitempty"`
+	IsActive          bool           `gorm:"default:true;index" json:"is_active"`
+	IsBusinessAccount bool           `gorm:"default:false" json:"is_business_account"` // NEW FIELD
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+	DeletedAt         gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 // WhatsAppContact represents a contact
 type WhatsAppContact struct {
-	ID           int64     `gorm:"primaryKey;autoIncrement" json:"id"`
-	UserID       int       `gorm:"not null;index:idx_user_jid,unique" json:"user_id"`
-	FullName     string    `gorm:"size:255" json:"full_name"`
-	FirstName    string    `gorm:"size:100" json:"first_name"`
-	LastName     string    `gorm:"size:155" json:"last_name"`
-	JID          string    `gorm:"column:jid;size:255;not null;index:idx_user_jid,unique" json:"jid"`
-	CountryCode  string    `gorm:"size:10" json:"country_code"`
-	MobileNumber string    `gorm:"size:50" json:"mobile_number"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID            int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	UserID        int       `gorm:"not null;index:idx_user_jid,unique" json:"user_id"`
+	FullName      string    `gorm:"size:255" json:"full_name"`
+	FirstName     string    `gorm:"size:100" json:"first_name"`
+	LastName      string    `gorm:"size:155" json:"last_name"`
+	JID           string    `gorm:"column:jid;size:255;not null;index:idx_user_jid,unique" json:"jid"`
+	CountryCode   string    `gorm:"size:10" json:"country_code"`
+	MobileNumber  string    `gorm:"size:50" json:"mobile_number"`
+	GroupID       *int64    `gorm:"index" json:"group_id,omitempty"`      // NEW FIELD
+	IsGroupMember bool      `gorm:"default:false" json:"is_group_member"` // NEW FIELD
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type WhatsAppGroup struct {
+	ID               int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	UserID           int       `gorm:"not null;index:idx_user_group,unique" json:"user_id"`
+	SessionID        string    `gorm:"type:char(36);index" json:"session_id"`
+	GroupJID         string    `gorm:"column:group_jid;size:255;not null;index:idx_user_group,unique" json:"group_jid"`
+	GroupName        string    `gorm:"size:255" json:"group_name"`
+	GroupSubject     *string   `gorm:"type:text" json:"group_subject,omitempty"`
+	ParticipantCount int       `gorm:"default:0" json:"participant_count"`
+	IsAnnouncement   bool      `gorm:"default:false" json:"is_announcement"`
+	IsLocked         bool      `gorm:"default:false" json:"is_locked"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // BeforeCreate hook to generate UUID
@@ -181,8 +199,8 @@ func NewDatabaseManager(cfg *Config) (*DatabaseManager, error) {
 		return nil, err
 	}
 
-	sqlDB.SetMaxIdleConns(10)
-	sqlDB.SetMaxOpenConns(100)
+	sqlDB.SetMaxIdleConns(50)
+	sqlDB.SetMaxOpenConns(200)
 	sqlDB.SetConnMaxLifetime(time.Hour)
 
 	log.Println("   ✅ MySQL connected successfully")
@@ -226,10 +244,33 @@ func NewDatabaseManager(cfg *Config) (*DatabaseManager, error) {
 }
 
 // Migrate creates all necessary tables and constraints
+// Replace the existing Migrate() function with this updated version:
 func (dm *DatabaseManager) Migrate() error {
-	// Auto migrate models
-	if err := dm.db.AutoMigrate(&WhatsAppSession{}, &WhatsAppEvent{}, &WhatsAppContact{}); err != nil {
+	// Auto migrate models - ADD WhatsAppGroup to the list
+	if err := dm.db.AutoMigrate(&WhatsAppSession{}, &WhatsAppEvent{}, &WhatsAppContact{}, &WhatsAppGroup{}); err != nil {
 		return err
+	}
+
+	// Add new columns to existing tables
+	// Check if is_business_account exists, if not add it
+	if !dm.db.Migrator().HasColumn(&WhatsAppSession{}, "is_business_account") {
+		if err := dm.db.Migrator().AddColumn(&WhatsAppSession{}, "is_business_account"); err != nil {
+			log.Printf("Warning: Failed to add is_business_account column: %v", err)
+		}
+	}
+
+	// Check if group_id exists in contacts, if not add it
+	if !dm.db.Migrator().HasColumn(&WhatsAppContact{}, "group_id") {
+		if err := dm.db.Migrator().AddColumn(&WhatsAppContact{}, "group_id"); err != nil {
+			log.Printf("Warning: Failed to add group_id column: %v", err)
+		}
+	}
+
+	// Check if is_group_member exists, if not add it
+	if !dm.db.Migrator().HasColumn(&WhatsAppContact{}, "is_group_member") {
+		if err := dm.db.Migrator().AddColumn(&WhatsAppContact{}, "is_group_member"); err != nil {
+			log.Printf("Warning: Failed to add is_group_member column: %v", err)
+		}
 	}
 
 	// Create stored procedure for device limit check
@@ -287,6 +328,8 @@ func (dm *DatabaseManager) Migrate() error {
 	// Create indexes
 	dm.db.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_user_status ON whats_app_sessions(user_id, status)")
 	dm.db.Exec("CREATE INDEX IF NOT EXISTS idx_events_session_created ON whats_app_events(session_id, created_at DESC)")
+	dm.db.Exec("CREATE INDEX IF NOT EXISTS idx_groups_session ON whats_app_groups(session_id)")
+	dm.db.Exec("CREATE INDEX IF NOT EXISTS idx_contacts_group ON whats_app_contacts(group_id)")
 
 	log.Println("   ✅ Migrations completed")
 	return nil
@@ -540,24 +583,28 @@ func (dm *DatabaseManager) Close() error {
 // ============= CONTACT REPOSITORY =============
 
 func (dm *DatabaseManager) UpsertContact(contact *WhatsAppContact) error {
-	// Use ON DUPLICATE KEY UPDATE (upsert)
-	return dm.db.Save(contact).Error
+	return dm.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "jid"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"full_name", "first_name", "last_name",
+			"country_code", "mobile_number",
+			"group_id", "is_group_member", "updated_at",
+		}),
+	}).Create(contact).Error
 }
 
 func (dm *DatabaseManager) BulkUpsertContacts(contacts []WhatsAppContact) error {
 	if len(contacts) == 0 {
 		return nil
 	}
-
-	// Batch insert/update
-	return dm.db.Transaction(func(tx *gorm.DB) error {
-		for _, contact := range contacts {
-			if err := tx.Save(&contact).Error; err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	return dm.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "jid"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"full_name", "first_name", "last_name",
+			"country_code", "mobile_number",
+			"group_id", "is_group_member", "updated_at",
+		}),
+	}).Create(&contacts).Error
 }
 
 func (dm *DatabaseManager) GetUserContacts(userID int) ([]WhatsAppContact, error) {
@@ -566,4 +613,45 @@ func (dm *DatabaseManager) GetUserContacts(userID int) ([]WhatsAppContact, error
 		Order("full_name ASC").
 		Find(&contacts).Error
 	return contacts, err
+}
+
+// ============= GROUP REPOSITORY (Add at the end of database.go) =============
+
+func (dm *DatabaseManager) UpsertGroup(group *WhatsAppGroup) error {
+	return dm.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "user_id"}, {Name: "group_jid"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"session_id",
+			"group_name",
+			"group_subject",
+			"participant_count",
+			"is_announcement",
+			"is_locked",
+			"updated_at",
+		}),
+	}).Create(group).Error // ✅ CORRECT - updates on conflict
+}
+
+func (dm *DatabaseManager) GetUserGroups(userID int) ([]WhatsAppGroup, error) {
+	var groups []WhatsAppGroup
+	err := dm.db.Where("user_id = ?", userID).
+		Order("group_name ASC").
+		Find(&groups).Error
+	return groups, err
+}
+
+func (dm *DatabaseManager) GetGroupByJID(userID int, groupJID string) (*WhatsAppGroup, error) {
+	var group WhatsAppGroup
+	err := dm.db.Where("user_id = ? AND group_jid = ?", userID, groupJID).
+		First(&group).Error
+	if err != nil {
+		return nil, err
+	}
+	return &group, nil
+}
+
+func (dm *DatabaseManager) UpdateSessionBusinessAccount(sessionID uuid.UUID, isBusiness bool) error {
+	return dm.db.Model(&WhatsAppSession{}).
+		Where("id = ?", sessionID.String()).
+		Update("is_business_account", isBusiness).Error
 }

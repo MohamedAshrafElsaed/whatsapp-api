@@ -9,17 +9,17 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
-	"log"
-	"net/http"
-	"strings"
-	"time"
-
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"log"
+	"net/http"
+	"strings"
+	"time"
 )
 
 // ============= MIDDLEWARE =============
@@ -484,6 +484,182 @@ func (h *APIHandlers) SendMessage(c *gin.Context) {
 	})
 }
 
+func (h *APIHandlers) SendMessageAdvanced(c *gin.Context) {
+	userID := c.GetInt("user_id")
+	sessionIDStr := c.Param("session_id")
+
+	// Define request structure
+	var req struct {
+		To          string `json:"to" binding:"required"`
+		MessageType string `json:"message_type" binding:"required"`
+		Content     struct {
+			Text        string `json:"text"`
+			MediaURL    string `json:"media_url"`
+			MediaBase64 string `json:"media_base64"`
+			Filename    string `json:"filename"`
+			Mimetype    string `json:"mimetype"`
+			IsVoice     bool   `json:"is_voice"` // For audio messages
+		} `json:"content"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	// Validate session ID format
+	_, err := uuid.Parse(sessionIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid session ID",
+		})
+		return
+	}
+
+	// Validate message type
+	validTypes := map[string]bool{
+		"text":     true,
+		"image":    true,
+		"video":    true,
+		"audio":    true,
+		"document": true,
+	}
+
+	if !validTypes[req.MessageType] {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid message_type. Must be one of: text, image, video, audio, document",
+		})
+		return
+	}
+
+	// Handle text messages
+	if req.MessageType == "text" {
+		if req.Content.Text == "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"error":   "Text content is required for text messages",
+			})
+			return
+		}
+
+		if err := h.whatsappService.SendMessage(sessionIDStr, userID, req.To, req.Content.Text); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"error":   err.Error(),
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"data": gin.H{
+				"message": "Text message sent successfully",
+				"to":      req.To,
+			},
+		})
+		return
+	}
+
+	// Handle media messages
+	var mediaData []byte
+
+	// Get media data - prioritize base64, fallback to URL
+	if req.Content.MediaBase64 != "" {
+		// Decode base64
+		// Remove data URI prefix if present (e.g., "data:image/png;base64,")
+		base64Data := req.Content.MediaBase64
+		if idx := strings.Index(base64Data, ","); idx != -1 {
+			base64Data = base64Data[idx+1:]
+		}
+
+		mediaData, err = base64.StdEncoding.DecodeString(base64Data)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"error":   "Invalid base64 media data: " + err.Error(),
+			})
+			return
+		}
+	} else if req.Content.MediaURL != "" {
+		// Download from URL
+		maxSize := h.getMaxSizeForType(req.MessageType)
+		mediaData, err = h.whatsappService.downloadMediaFromURL(req.Content.MediaURL, maxSize)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"error":   "Failed to download media: " + err.Error(),
+			})
+			return
+		}
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Either media_url or media_base64 is required for media messages",
+		})
+		return
+	}
+
+	// Validate media size
+	maxSize := h.getMaxSizeForType(req.MessageType)
+	if int64(len(mediaData)) > maxSize {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("Media file too large: %d bytes (max %d bytes)", len(mediaData), maxSize),
+		})
+		return
+	}
+
+	// Send appropriate message type
+	switch req.MessageType {
+	case "image":
+		err = h.whatsappService.SendImageMessage(sessionIDStr, userID, req.To, mediaData, req.Content.Text)
+	case "video":
+		err = h.whatsappService.SendVideoMessage(sessionIDStr, userID, req.To, mediaData, req.Content.Text)
+	case "audio":
+		err = h.whatsappService.SendAudioMessage(sessionIDStr, userID, req.To, mediaData, req.Content.IsVoice)
+	case "document":
+		err = h.whatsappService.SendDocumentMessage(sessionIDStr, userID, req.To, mediaData, req.Content.Filename, req.Content.Mimetype)
+	}
+
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"message": fmt.Sprintf("%s message sent successfully", strings.Title(req.MessageType)),
+			"to":      req.To,
+			"type":    req.MessageType,
+		},
+	})
+}
+
+// getMaxSizeForType returns the maximum file size for each media type
+func (h *APIHandlers) getMaxSizeForType(messageType string) int64 {
+	switch messageType {
+	case "image":
+		return 16 * 1024 * 1024 // 16 MB
+	case "video":
+		return 100 * 1024 * 1024 // 100 MB
+	case "audio":
+		return 16 * 1024 * 1024 // 16 MB
+	case "document":
+		return 100 * 1024 * 1024 // 100 MB
+	default:
+		return 16 * 1024 * 1024 // 16 MB default
+	}
+}
+
 // WebSocket upgrader
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -623,4 +799,124 @@ func (h *APIHandlers) HealthCheck(c *gin.Context) {
 		"status":  "healthy",
 		"time":    time.Now(),
 	})
+}
+
+func (h *APIHandlers) ValidateAccount(c *gin.Context) {
+	userID := c.GetInt("user_id")
+
+	var req struct {
+		PhoneNumber string `json:"phone_number" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid request: " + err.Error(),
+		})
+		return
+	}
+
+	// Clean phone number - remove all non-digit characters
+	cleanNumber := ""
+	for _, char := range req.PhoneNumber {
+		if char >= '0' && char <= '9' {
+			cleanNumber += string(char)
+		}
+	}
+
+	// Validate cleaned number
+	if cleanNumber == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid phone number format",
+		})
+		return
+	}
+
+	// We need a connected session to validate numbers
+	// Try to find any connected session for this user
+	sessions, err := h.whatsappService.GetUserSessions(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to retrieve sessions",
+		})
+		return
+	}
+
+	// Find first connected session
+	var connectedSessionID string
+	for _, session := range sessions {
+		if session.Status == StatusConnected {
+			connectedSessionID = session.ID
+			break
+		}
+	}
+
+	if connectedSessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "No connected WhatsApp session found. Please connect at least one session first.",
+		})
+		return
+	}
+
+	// Get session client
+	sc, err := h.whatsappService.GetSessionClient(connectedSessionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to get session client",
+		})
+		return
+	}
+
+	if !sc.Client.IsConnected() {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Session is not connected",
+		})
+		return
+	}
+
+	// Validate the number on WhatsApp
+	ctx := context.Background()
+	resp, err := sc.Client.IsOnWhatsApp(ctx, []string{"+" + cleanNumber})
+	if err != nil {
+		log.Printf("Failed to validate phone number %s: %v", cleanNumber, err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to validate phone number: " + err.Error(),
+		})
+		return
+	}
+
+	// Check response
+	if len(resp) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"data": gin.H{
+				"phone_number":  cleanNumber,
+				"is_valid":      false,
+				"is_registered": false,
+				"jid":           nil,
+			},
+		})
+		return
+	}
+
+	// Return validation result
+	result := resp[0]
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"phone_number":  cleanNumber,
+			"is_valid":      true,
+			"is_registered": result.IsIn,
+			"jid":           result.JID.String(),
+		},
+	})
+
+	log.Printf("✅ Validated phone number %s: registered=%v, jid=%s",
+		cleanNumber, result.IsIn, result.JID.String())
 }

@@ -39,6 +39,10 @@ type Config struct {
 
 	// CORS
 	CORSAllowedOrigins string
+
+	// Group sync settings
+	GroupSyncDelay         time.Duration
+	GroupSyncRetryAttempts int
 }
 
 func LoadConfig() (*Config, error) {
@@ -70,6 +74,9 @@ func LoadConfig() (*Config, error) {
 
 		// CORS
 		CORSAllowedOrigins: getEnv("CORS_ALLOWED_ORIGINS", "*"),
+
+		GroupSyncDelay:         parseDuration(getEnv("GROUP_SYNC_DELAY", "2s"), 2*time.Second),
+		GroupSyncRetryAttempts: parseInt(getEnv("GROUP_SYNC_RETRY_ATTEMPTS", "3"), 3),
 	}
 
 	// Validate required fields
@@ -159,7 +166,6 @@ func main() {
 	// Health check (no auth required)
 	router.GET("/health", handlers.HealthCheck)
 
-	// API v1 routes
 	v1 := router.Group("/api/v1")
 	{
 		// Protected routes (require JWT auth)
@@ -175,8 +181,14 @@ func main() {
 			// Messaging
 			protected.POST("/sessions/:session_id/send", handlers.SendMessage)
 
+			// NEW: Advanced messaging with media support
+			protected.POST("/sessions/:session_id/send-advanced", handlers.SendMessageAdvanced)
+
 			// Device summary
 			protected.GET("/devices/summary", handlers.GetDeviceSummary)
+
+			// NEW: Account validation
+			protected.POST("/validate-account", handlers.ValidateAccount)
 		}
 
 		// WebSocket endpoint (uses token query param)
