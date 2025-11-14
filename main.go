@@ -116,8 +116,9 @@ func parseInt(s string, defaultValue int) int {
 
 // ============= MAIN =============
 
-func main() {
+// ============= UPDATE MAIN FUNCTION (Replace main() in main.go) =============
 
+func main() {
 	// Load configuration
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -142,6 +143,14 @@ func main() {
 	// Initialize WhatsApp service
 	log.Println("Initializing WhatsApp service...")
 	whatsappService := NewWhatsAppService(cfg, db, wsManager)
+
+	// Create context for graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start session health monitor
+	whatsappService.StartSessionMonitor(ctx)
+	defer whatsappService.StopSessionMonitor()
 
 	// Restore active sessions
 	if err := whatsappService.RestoreActiveSessions(); err != nil {
@@ -178,16 +187,17 @@ func main() {
 			protected.GET("/sessions/:session_id/status", handlers.GetSessionStatus)
 			protected.DELETE("/sessions/:session_id", handlers.DeleteSession)
 
+			// NEW: Manual session refresh
+			protected.POST("/sessions/:session_id/refresh", handlers.RefreshSession)
+
 			// Messaging
 			protected.POST("/sessions/:session_id/send", handlers.SendMessage)
-
-			// NEW: Advanced messaging with media support
 			protected.POST("/sessions/:session_id/send-advanced", handlers.SendMessageAdvanced)
 
 			// Device summary
 			protected.GET("/devices/summary", handlers.GetDeviceSummary)
 
-			// NEW: Account validation
+			// Account validation
 			protected.POST("/validate-account", handlers.ValidateAccount)
 		}
 
@@ -219,11 +229,20 @@ func main() {
 
 	log.Println("Shutting down server...")
 
-	// Graceful shutdown with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// Cancel context to stop background tasks
+	cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	// Graceful shutdown with timeout
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	// Stop session monitor
+	whatsappService.StopSessionMonitor()
+
+	// Cleanup WhatsApp resources
+	whatsappService.Cleanup()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Server forced to shutdown: %v", err)
 	}
 

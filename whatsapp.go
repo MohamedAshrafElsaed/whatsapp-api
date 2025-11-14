@@ -141,6 +141,8 @@ type WhatsAppService struct {
 	wsManager   *WebSocketManager
 	container   *sqlstore.Container
 	containerMu sync.RWMutex
+	monitorCtx  context.Context    // ADD THIS
+	monitorStop context.CancelFunc // ADD THIS
 }
 
 // NewWhatsAppService creates a new WhatsApp service
@@ -1007,12 +1009,17 @@ func (ws *WhatsAppService) getMessageType(msg *waE2E.Message) string {
 
 // Cleanup cleans up resources
 func (ws *WhatsAppService) Cleanup() {
+	// Stop monitor if running
+	ws.StopSessionMonitor()
+
+	// Disconnect all sessions
 	ws.sessions.Range(func(key, value interface{}) bool {
 		sc := value.(*SessionClient)
 		sc.Client.Disconnect()
 		return true
 	})
 
+	// Close container
 	ws.containerMu.Lock()
 	if ws.container != nil {
 		ws.container.Close()
@@ -1602,4 +1609,242 @@ func (ws *WhatsAppService) processGroupWithRetry(sc *SessionClient, groupInfo *t
 		return err
 	}
 	return fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
+}
+
+func (ws *WhatsAppService) StartSessionMonitor(ctx context.Context) {
+	ws.monitorCtx, ws.monitorStop = context.WithCancel(ctx)
+	go ws.sessionMonitorLoop()
+	log.Println("✅ Session health monitor started")
+}
+
+func (ws *WhatsAppService) StopSessionMonitor() {
+	if ws.monitorStop != nil {
+		ws.monitorStop()
+		log.Println("🛑 Session health monitor stopped")
+	}
+}
+func (ws *WhatsAppService) sessionMonitorLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	// Initial check after 10 seconds
+	initialTimer := time.NewTimer(10 * time.Second)
+	defer initialTimer.Stop()
+
+	for {
+		select {
+		case <-ws.monitorCtx.Done():
+			return
+		case <-initialTimer.C:
+			ws.checkAllSessionHealth()
+		case <-ticker.C:
+			ws.checkAllSessionHealth()
+		}
+	}
+}
+
+func (ws *WhatsAppService) checkAllSessionHealth() {
+	log.Println("🔍 Checking health of all active sessions...")
+
+	checkedCount := 0
+	reconnectedCount := 0
+	failedCount := 0
+
+	// Get all connected sessions from database
+	var sessions []WhatsAppSession
+	err := ws.db.db.Where("status = ? AND deleted_at IS NULL", StatusConnected).
+		Find(&sessions).Error
+	if err != nil {
+		log.Printf("❌ Failed to fetch sessions for health check: %v", err)
+		return
+	}
+
+	for _, session := range sessions {
+		checkedCount++
+
+		// Update last_seen timestamp
+		sessionUUID, _ := uuid.Parse(session.ID)
+		now := time.Now()
+		ws.db.db.Model(&WhatsAppSession{}).
+			Where("id = ?", session.ID).
+			Update("last_seen", now)
+
+		// Check if session exists in memory
+		clientInterface, exists := ws.sessions.Load(session.ID)
+		if !exists {
+			// Session not in memory but should be connected, try to restore
+			log.Printf("⚠️ Session %s not in memory, attempting restoration...", session.SessionName)
+			if err := ws.restoreSingleSession(&session); err != nil {
+				log.Printf("❌ Failed to restore session %s: %v", session.SessionName, err)
+				failedCount++
+				ws.db.UpdateSessionStatus(sessionUUID, StatusDisconnected)
+			} else {
+				log.Printf("✅ Successfully restored session %s", session.SessionName)
+				reconnectedCount++
+			}
+			continue
+		}
+
+		// Check if client is actually connected
+		sc := clientInterface.(*SessionClient)
+		if !sc.Client.IsConnected() {
+			log.Printf("⚠️ Session %s is disconnected, attempting reconnection...", session.SessionName)
+
+			// Try to reconnect
+			if err := ws.reconnectSession(sc); err != nil {
+				log.Printf("❌ Failed to reconnect session %s: %v", session.SessionName, err)
+				failedCount++
+				ws.db.UpdateSessionStatus(sessionUUID, StatusDisconnected)
+
+				// Send WebSocket notification
+				ws.wsManager.SendToSession(session.ID, WebSocketMessage{
+					Type: "session_health",
+					Data: map[string]interface{}{
+						"status":    "disconnected",
+						"error":     err.Error(),
+						"timestamp": time.Now(),
+					},
+				})
+			} else {
+				log.Printf("✅ Successfully reconnected session %s", session.SessionName)
+				reconnectedCount++
+
+				// Send WebSocket notification
+				ws.wsManager.SendToSession(session.ID, WebSocketMessage{
+					Type: "session_health",
+					Data: map[string]interface{}{
+						"status":    "reconnected",
+						"timestamp": time.Now(),
+					},
+				})
+			}
+		}
+	}
+
+	if checkedCount > 0 {
+		log.Printf("🔍 Health check complete: %d checked, %d reconnected, %d failed",
+			checkedCount, reconnectedCount, failedCount)
+	}
+}
+
+// reconnectSession attempts to reconnect a disconnected session
+func (ws *WhatsAppService) reconnectSession(sc *SessionClient) error {
+	// Disconnect first if needed
+	if sc.Client.IsConnected() {
+		sc.Client.Disconnect()
+		time.Sleep(1 * time.Second)
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Attempt to connect
+	if err := sc.Client.Connect(); err != nil {
+		return fmt.Errorf("failed to connect: %w", err)
+	}
+
+	// Wait for connection to be established
+	connChan := make(chan bool, 1)
+	go func() {
+		for i := 0; i < 30; i++ {
+			if sc.Client.IsConnected() {
+				connChan <- true
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+		connChan <- false
+	}()
+
+	select {
+	case connected := <-connChan:
+		if !connected {
+			return fmt.Errorf("connection timeout")
+		}
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("connection timeout")
+	}
+}
+
+// RefreshSession manually refreshes a session by disconnecting and reconnecting
+func (ws *WhatsAppService) RefreshSession(sessionID string, userID int) error {
+	// Validate session ID
+	sessionUUID, err := uuid.Parse(sessionID)
+	if err != nil {
+		return fmt.Errorf("invalid session ID")
+	}
+
+	// Check if user owns the session
+	session, err := ws.db.GetSession(sessionUUID, userID)
+	if err != nil {
+		return fmt.Errorf("session not found or unauthorized")
+	}
+
+	log.Printf("🔄 Manual refresh requested for session %s", session.SessionName)
+
+	// Check if session exists in memory
+	clientInterface, exists := ws.sessions.Load(sessionID)
+	if !exists {
+		// Session not in memory, try to restore it
+		log.Printf("📱 Session %s not in memory, attempting restoration...", session.SessionName)
+
+		// Only restore if it has a JID (was previously connected)
+		if session.JID == nil || *session.JID == "" {
+			return fmt.Errorf("session was never connected")
+		}
+
+		if err := ws.restoreSingleSession(session); err != nil {
+			// Update status to disconnected
+			ws.db.UpdateSessionStatus(sessionUUID, StatusDisconnected)
+			return fmt.Errorf("failed to restore session: %w", err)
+		}
+
+		// Try to load again after restoration
+		clientInterface, exists = ws.sessions.Load(sessionID)
+		if !exists {
+			return fmt.Errorf("failed to load session after restoration")
+		}
+	}
+
+	// Get the session client
+	sc := clientInterface.(*SessionClient)
+
+	// Force disconnect
+	log.Printf("🔌 Disconnecting session %s...", session.SessionName)
+	sc.Client.Disconnect()
+	time.Sleep(2 * time.Second)
+
+	// Attempt reconnection
+	log.Printf("🔌 Reconnecting session %s...", session.SessionName)
+	if err := ws.reconnectSession(sc); err != nil {
+		// Update status to disconnected
+		ws.db.UpdateSessionStatus(sessionUUID, StatusDisconnected)
+
+		// Log event
+		ws.db.CreateEvent(sessionUUID, userID, "refresh_failed", map[string]interface{}{
+			"error": err.Error(),
+		})
+
+		return fmt.Errorf("failed to reconnect: %w", err)
+	}
+
+	// Update status to connected
+	ws.db.UpdateSessionStatus(sessionUUID, StatusConnected)
+
+	// Log event
+	ws.db.CreateEvent(sessionUUID, userID, "refresh_success", nil)
+
+	// Send WebSocket notification
+	ws.wsManager.SendToSession(sessionID, WebSocketMessage{
+		Type: "session_refreshed",
+		Data: map[string]interface{}{
+			"status":    "connected",
+			"timestamp": time.Now(),
+		},
+	})
+
+	log.Printf("✅ Successfully refreshed session %s", session.SessionName)
+	return nil
 }

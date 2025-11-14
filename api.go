@@ -920,3 +920,59 @@ func (h *APIHandlers) ValidateAccount(c *gin.Context) {
 	log.Printf("✅ Validated phone number %s: registered=%v, jid=%s",
 		cleanNumber, result.IsIn, result.JID.String())
 }
+
+func (h *APIHandlers) RefreshSession(c *gin.Context) {
+	userID := c.GetInt("user_id")
+	sessionIDStr := c.Param("session_id")
+
+	// Parse session ID (validate format)
+	_, err := uuid.Parse(sessionIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "Invalid session ID",
+		})
+		return
+	}
+
+	// Refresh the session
+	if err := h.whatsappService.RefreshSession(sessionIDStr, userID); err != nil {
+		// Determine appropriate status code
+		statusCode := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "unauthorized") {
+			statusCode = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "never connected") {
+			statusCode = http.StatusBadRequest
+		}
+
+		c.JSON(statusCode, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	// Get updated session status
+	session, err := h.whatsappService.GetSessionStatus(sessionIDStr, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "Failed to get updated session status",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Session refreshed successfully",
+		"data": gin.H{
+			"session_id":   session.ID,
+			"status":       session.Status,
+			"phone_number": session.PhoneNumber,
+			"jid":          session.JID,
+			"push_name":    session.PushName,
+			"last_seen":    session.LastSeen,
+			"connected_at": session.ConnectedAt,
+		},
+	})
+}
